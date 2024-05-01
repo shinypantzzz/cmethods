@@ -1,70 +1,219 @@
-// The module 'vscode' contains the VS Code extensibility API
-// Import the module and reference it with the alias vscode in your code below
-import * as vscode from 'vscode';
+import { 
+	Range,
+	Position,
+	CompletionItemProvider,
+	TextDocument,
+	CancellationToken,
+	CompletionContext,
+	ProviderResult,
+	CompletionItem,
+	Location,
+	SymbolInformation,
+	DocumentSymbol,
+	CompletionItemKind,
+	SnippetString,
+	TextEdit,
+	ExtensionContext,
+	commands,
+	languages,
+	Uri,
+	workspace,
+	SymbolKind
+} from 'vscode';
 
+import executeCommand = commands.executeCommand; 
+import registerCompletionItemProvider = languages.registerCompletionItemProvider;
+import openTextDocument = workspace.openTextDocument;
 
-class CCompletionItemProvider implements vscode.CompletionItemProvider {
-	provideCompletionItems(document: vscode.TextDocument, position: vscode.Position, token: vscode.CancellationToken, context: vscode.CompletionContext): vscode.ProviderResult<vscode.CompletionItem[] | vscode.CompletionList<vscode.CompletionItem>> {
-		let regex = new RegExp("\\w[\\w\\.\\(\\)]*[\\w\\)]|\\w");
-		let regex_no_brackets = new RegExp("\\w[\\w\\.]*\\w|\\w");
-		let offset = document.offsetAt(position);
-		let word_range = document.getWordRangeAtPosition(document.positionAt(offset - 1), regex);
-		let word_range_no_brackets = document.getWordRangeAtPosition(word_range?.start!, regex_no_brackets);
-		return vscode.commands.executeCommand<vscode.Location[]>("vscode.executeDefinitionProvider", document.uri, word_range_no_brackets?.end).then(
-			def_location => {
-				console.log(def_location);
-				let type = document.getText(document.getWordRangeAtPosition(document.positionAt(document.offsetAt(def_location[0].range.start)-2)))
-				console.log(type);
-				return vscode.commands.executeCommand<vscode.SymbolInformation[] | vscode.DocumentSymbol[]>("vscode.executeDocumentSymbolProvider", document.uri).then(
-					symbols => {
-						let completions = new vscode.CompletionList();
-						symbols.filter(value => value.kind == 11).forEach(value => {
-							let line_text = value.name;
-							let open_bracket_index = line_text.indexOf("(");
-							let close_bracket_index = line_text.lastIndexOf(")");
-							if (close_bracket_index <= open_bracket_index + 1) {
-								return;
-							}
-							let args = line_text.substring(open_bracket_index + 1, close_bracket_index).split(",");
-							let first_arg_type = args[0];
-							let first_arg_type_list = first_arg_type.split(" ");
-							let arg_strart = "(";
-							if (first_arg_type_list[first_arg_type_list.length-1].includes("*")) {
-								first_arg_type = first_arg_type_list[first_arg_type_list.length-2];
-								arg_strart += "&";
-							} else {
-								first_arg_type = first_arg_type_list[first_arg_type_list.length-1];
-							}
-							if (first_arg_type == type) {
-								let completion = new vscode.CompletionItem(line_text)
-								completion.kind = vscode.CompletionItemKind.Method;
-								let variable = document.getText(word_range);
-								completion.insertText = new vscode.SnippetString()
-								completion.insertText.appendText(line_text.split("(")[0] + arg_strart + variable);
-								if (args.length > 1) completion.insertText.appendText(", ").appendTabstop();
-								completion.insertText.appendText(")");
-								completion.additionalTextEdits = [];
-								completion.additionalTextEdits.push(vscode.TextEdit.delete(word_range?.with(undefined, word_range.end.with(undefined, word_range.end.character+1))!))
-								completions.items.push(completion);
-							}
-						});
-						return completions;
-					}
-				);
+class CCompletionItemProvider implements CompletionItemProvider {
+
+	private readonly maxContextSize = 128;
+
+	private documents: Uri[] = [];
+	private includes: Map<Uri, Set<Uri>> = new Map();
+	private funcs: Map<Uri, Map<string, {name: string, firstArgIsPointer: boolean, multiArg: boolean}[]>> = new Map();
+
+	private static getIncludePositions(document: TextDocument): Position[] {
+		let includePositions: Position[] = [];
+		for (let i = 0; i < document.lineCount; i++) {
+			let line = document.lineAt(i).text.trimStart();
+			if (line.startsWith('#') && line.slice(1).trimStart().startsWith('include')) {
+				let endingSpaces = 0
+				while (line.at(line.length - endingSpaces - 1) === ' ') endingSpaces++;
+				includePositions.push(document.lineAt(i).range.end.translate({ characterDelta: -endingSpaces-1 }))
 			}
-		);
+		}
 
-		
+		return includePositions;
+	}
+
+	private static async getIncludeUri(uri: Uri, position: Position): Promise<Uri> {
+	 	let locations = await executeCommand<Location[]>("vscode.executeDefinitionProvider", uri, position);
+		return locations[0].uri;
+	}
+
+	public async onNewDocument(uri: Uri): Promise<void> {
+		this.documents.push(uri);
+
+		await this.setIncludes(uri);
+	}
+
+	private async setIncludes(uri: Uri): Promise<void> {
+		let document = await openTextDocument(uri);
+
+		let includePositions = CCompletionItemProvider.getIncludePositions(document);
+
+		await this.setFuncs(uri);
+
+		let includeUris = new Set(
+			await Promise.all(includePositions.map(val => CCompletionItemProvider.getIncludeUri(uri, val).then(
+				async includeUri => {
+				 	await this.setFuncs(includeUri);
+					return includeUri;
+				}
+			)))
+		);
+		includeUris.add(uri);
+		this.includes.set(uri, includeUris);
+	}
+
+	private async setFuncs(uri: Uri): Promise<void> {
+		let funcs = (await executeCommand<SymbolInformation[] | DocumentSymbol[]>("vscode.executeDocumentSymbolProvider", uri))
+			.filter(symbol => symbol.kind === SymbolKind.Function)
+			.map(val => this.prepareFunc(val.name))
+			.filter(val => val.argsCount > 0)
+			.reduce<Map<string, {name: string, firstArgIsPointer: boolean, multiArg: boolean}[]>>((prev, val) => 
+				prev.set(val.firstArgType!, (prev.get(val.firstArgType!) ?? []).concat(
+					{name: val.name, firstArgIsPointer: val.firstArgIsPointer!, multiArg: val.argsCount > 1}
+				))
+			, new Map());
+
+		this.funcs.set(uri, funcs);
+	}
+
+	provideCompletionItems(
+		document: TextDocument,
+		position: Position,
+		token: CancellationToken,
+		context: CompletionContext
+	): ProviderResult<CompletionItem[]> {
+
+		if  (context.triggerCharacter != ".") return;
+
+		return this.generateCompletionItems(document, position);
+
+	}
+
+	private async generateCompletionItems(document: TextDocument, position: Position): Promise<CompletionItem[]> {
+		if (!this.documents.includes(document.uri)) await this.onNewDocument(document.uri);
+		let offset = document.offsetAt(position) - 1;
+		let textContext = document.getText(new Range(
+			document.positionAt(offset - this.maxContextSize >= 0 ? offset - this.maxContextSize : 0),
+			position.translate(undefined, -1)
+		));
+		let tokenBoundaries = this.getTokenBoundaries(textContext);
+		let tokenRange = new Range(document.positionAt(offset - tokenBoundaries[0]), document.positionAt(offset));
+		let goToDefinitionPosition = document.positionAt(offset - tokenBoundaries[1]);
+
+		let defLocations = await executeCommand<Location[]>("vscode.executeDefinitionProvider", document.uri, goToDefinitionPosition);
+		let defDocument = await openTextDocument(defLocations[0].uri);
+		let defLine = defDocument.lineAt(defLocations[0].range.start.line);
+		let tokenIsPointer = false;
+		let char = defLocations[0].range.start.character - 1;
+		while (defLine.text.charAt(char) === ' ') char--;
+		if (defLine.text.charAt(char) === '*') {
+			tokenIsPointer = true;
+			char--;
+			while (defLine.text.charAt(char) === ' ') char--;
+		}
+		let type = defDocument.getText(defDocument.getWordRangeAtPosition(new Position(defLine.lineNumber, char)));
+
+		let completions: Map<string, CompletionItem> = new Map();
+		this.includes.get(document.uri)!.forEach(val => {
+			(this.funcs.get(val)!.get(type) ?? [])
+			.forEach(val => completions.set(val.name, this.makeCompletion(document, tokenRange, tokenIsPointer, val)))
+		});
+
+		return Array.from(completions.values());
+	}
+
+	getTokenBoundaries(text: string): number[] {
+		let cur_char = text.length-1;
+		let res = [-1, -1];
+		if (text[cur_char] === ')') {
+			let brackets = 1;
+			while (brackets != 0) {
+				cur_char -= 1;
+				if (cur_char < 0) return res;
+				if (text[cur_char] === ')') brackets++;
+				else if (text[cur_char] === '(') brackets--;
+			}
+		}
+		res[1] = text.length - cur_char;
+		const stop_chars = [' ', '\n', ';', '*', '+', '-', '=', '/', '&', '%'];
+		let brackets = 0;
+		while (brackets >= 0) {
+			cur_char -= 1;
+			if (cur_char < 0) return res;
+			if (text[cur_char] === ')') brackets++;
+			else if (text[cur_char] === '(') brackets--;
+			else if (stop_chars.includes(text[cur_char])) break;
+		}
+		res[0] = text.length - cur_char - 1;
+
+		return res;
+	}
+
+	prepareFunc(func: string): { name: string, firstArgType?: string, firstArgIsPointer?: boolean, argsCount: number} {
+		let name = func.slice(0, func.indexOf('('))
+
+		let args = func.slice(func.indexOf('(') + 1, func.lastIndexOf(')')).split(',');
+
+		if (args.length === 1 && args[0].trim() === '') return { name: name, argsCount: 0};
+
+		let firstArgTokens = args[0].split(" ").filter(val => val !== '');
+		let firstArgIsPointer = firstArgTokens[firstArgTokens.length - 1] === '*';
+		let firstArgType = firstArgIsPointer? firstArgTokens[firstArgTokens.length - 2] : firstArgTokens[firstArgTokens.length - 1];
+
+		return {
+			name: name,
+			firstArgType: firstArgType,
+			firstArgIsPointer: firstArgIsPointer,
+			argsCount: args.length
+		}
+	}
+
+	makeCompletion(
+		document: TextDocument,
+		tokenRange: Range,
+		tokenIsPointer: boolean,
+		func: {
+			name: string,
+			firstArgIsPointer: boolean,
+			multiArg: boolean
+		}
+	): CompletionItem {
+
+		let completion = new CompletionItem(func.name)
+		completion.kind = CompletionItemKind.Method;
+		completion.insertText = new SnippetString()
+		let prefix = "";
+		if (tokenIsPointer && !func.firstArgIsPointer) prefix = "*";
+		else if (func.firstArgIsPointer && !tokenIsPointer) prefix = "&";
+		completion.insertText.appendText(func.name + '(' + prefix + document.getText(tokenRange));
+		if (func.multiArg) completion.insertText.appendText(", ").appendTabstop();
+		completion.insertText.appendText(")");
+		completion.additionalTextEdits = [TextEdit.delete(tokenRange.with({ end: tokenRange.end.translate(0, 1) }))];
+
+		return completion;
 	}
 }
 
-// This method is called when your extension is activated
-// Your extension is activated the very first time the command is executed
-export function activate(context: vscode.ExtensionContext) {
-	context.subscriptions.push(vscode.languages.registerCompletionItemProvider(
+export function activate(context: ExtensionContext) {
+	context.subscriptions.push(registerCompletionItemProvider(
 		"c", new CCompletionItemProvider(), '.'
 	));
 }
 
-// This method is called when your extension is deactivated
+
 export function deactivate() {}
