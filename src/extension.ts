@@ -18,24 +18,29 @@ import {
 	languages,
 	Uri,
 	workspace,
-	SymbolKind
+	SymbolKind,
+	TextDocumentChangeEvent,
 } from 'vscode';
 
 import executeCommand = commands.executeCommand; 
 import registerCompletionItemProvider = languages.registerCompletionItemProvider;
 import openTextDocument = workspace.openTextDocument;
+import { channel } from 'diagnostics_channel';
 
 class CCompletionItemProvider implements CompletionItemProvider {
 
 	private readonly maxContextSize = 128;
+	private readonly updateInterval = 5000;
 
-	private documents: Uri[] = [];
 	private includes: Map<Uri, Set<Uri>> = new Map();
 	private funcs: Map<Uri, Map<string, {name: string, firstArgIsPointer: boolean, multiArg: boolean}[]>> = new Map();
 
-	private static getIncludePositions(document: TextDocument): Position[] {
+	private static getIncludePositions(document: TextDocument, range?: Range): Position[] {
+		if (range === undefined) {
+			range = new Range(new Position(0, 0), document.lineAt(document.lineCount - 1).range.end);
+		}
 		let includePositions: Position[] = [];
-		for (let i = 0; i < document.lineCount; i++) {
+		for (let i = range.start.line; i <= range.end.line; i++) {
 			let line = document.lineAt(i).text.trimStart();
 			if (line.startsWith('#') && line.slice(1).trimStart().startsWith('include')) {
 				let endingSpaces = 0
@@ -49,30 +54,40 @@ class CCompletionItemProvider implements CompletionItemProvider {
 
 	private static async getIncludeUri(uri: Uri, position: Position): Promise<Uri> {
 	 	let locations = await executeCommand<Location[]>("vscode.executeDefinitionProvider", uri, position);
-		return locations[0].uri;
+		return locations[0]?.uri;
 	}
 
 	public async onNewDocument(uri: Uri): Promise<void> {
-		this.documents.push(uri);
-
-		await this.setIncludes(uri);
-	}
-
-	private async setIncludes(uri: Uri): Promise<void> {
-		let document = await openTextDocument(uri);
-
-		let includePositions = CCompletionItemProvider.getIncludePositions(document);
-
 		await this.setFuncs(uri);
 
-		let includeUris = new Set(
-			await Promise.all(includePositions.map(val => CCompletionItemProvider.getIncludeUri(uri, val).then(
-				async includeUri => {
-				 	await this.setFuncs(includeUri);
-					return includeUri;
-				}
-			)))
-		);
+		await this.setIncludes(uri);
+
+		setInterval(() => this.setIncludes(uri), this.updateInterval)
+	}
+
+	public async onDocumentChange(e: TextDocumentChangeEvent): Promise<void> {
+		await this.setFuncs(e.document.uri);
+		await Promise.all(e.contentChanges.map(change => {
+			this.setIncludes(e.document.uri, change.range)
+		}));
+	}
+
+	private async setIncludes(uri: Uri, range?: Range): Promise<void> {
+		let document = await openTextDocument(uri);
+
+		if (!range) await this.setFuncs(uri);
+
+		let includePositions = CCompletionItemProvider.getIncludePositions(document, range);
+
+		let includeUris = new Set<Uri>();
+		if (range && this.includes.get(uri)) includeUris = this.includes.get(uri)!;
+
+		(await Promise.all(includePositions.map(val => CCompletionItemProvider.getIncludeUri(uri, val).then(
+			async includeUri => {
+				if (includeUri) await this.setFuncs(includeUri);
+				return includeUri;
+			}
+		)))).forEach(includeUri => { if (includeUri) includeUris.add(includeUri) });
 		includeUris.add(uri);
 		this.includes.set(uri, includeUris);
 	}
@@ -105,7 +120,7 @@ class CCompletionItemProvider implements CompletionItemProvider {
 	}
 
 	private async generateCompletionItems(document: TextDocument, position: Position): Promise<CompletionItem[]> {
-		if (!this.documents.includes(document.uri)) await this.onNewDocument(document.uri);
+		if (!this.includes.has(document.uri)) await this.onNewDocument(document.uri);
 		let offset = document.offsetAt(position) - 1;
 		let textContext = document.getText(new Range(
 			document.positionAt(offset - this.maxContextSize >= 0 ? offset - this.maxContextSize : 0),
@@ -210,8 +225,13 @@ class CCompletionItemProvider implements CompletionItemProvider {
 }
 
 export function activate(context: ExtensionContext) {
+
+	let cCompletionItemProvider = new CCompletionItemProvider();
+
+	//workspace.onDidChangeTextDocument((e) => cCompletionItemProvider.onDocumentChange(e));
+
 	context.subscriptions.push(registerCompletionItemProvider(
-		"c", new CCompletionItemProvider(), '.'
+		"c", cCompletionItemProvider, '.'
 	));
 }
 
